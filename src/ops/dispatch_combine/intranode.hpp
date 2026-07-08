@@ -30,6 +30,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/common.hpp"
 #include "src/ops/dispatch_combine/convert.hpp"
+#include "src/ops/dispatch_combine/ep_ll_helpers.hpp"
 #ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
 #endif
@@ -80,7 +81,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool EnableStdMoE = false>
+template <typename T, bool EnableStdMoE = false, bool EnableSnooze = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
@@ -196,7 +197,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      if constexpr (EnableSnooze) {
+        // [exp/epll-port] P3: s_sleep backoff on the cross-device reuse spin (ep_ll snooze).
+        while (core::AtomicLoadRelaxedSystem(signal) != 0) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+      } else {
+        shmem::ShmemInt32WaitUntilEquals(signal, 0);
+      }
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
@@ -208,7 +216,17 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      index_t recvTokenNum;
+      if constexpr (EnableSnooze) {
+        // [exp/epll-port] P3: s_sleep backoff on the cross-device count-wait spin (ep_ll snooze).
+        index_t v;
+        while ((v = core::AtomicLoadRelaxedSystem(signal)) <= 0) {
+          __builtin_amdgcn_s_sleep(1);
+        }
+        recvTokenNum = v - 1;
+      } else {
+        recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+      }
       core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 
@@ -229,8 +247,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
-template <typename T, bool EnableStdMoE = false>
+template <typename T, bool EnableStdMoE = false, bool EnableSnooze = false,
+          bool EnableSPSC = false, bool EnableLL128 = false, bool EnableEpll = false,
+          bool EnableEpllNoMeta = false, bool EnableEpllLine = false>
 __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
+  // [exp/epll-port] epll_full (LL128 self-flagged lines) carries only hidden in staging and routes
+  // metadata via the deferred remote scalar writes (base-style), exactly like the nometa path.
+  constexpr bool kEpllDeferMeta = EnableEpllNoMeta || EnableEpllLine;
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -254,6 +277,10 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
   __shared__ uint64_t groupData[kMaxWarpGroups];  // (iteration+1, destTokId)
   __shared__ int groupCounters[kMaxWarpGroups];   // consume counter
+  // [exp/epll-port] epll send: monotonic per-group "copy done" epoch. Every warp in the group
+  // bumps it after copying+fencing its hidden chunk; the header warp waits on it before
+  // publishing the per-slot release flag, so flag-visible => all warps' data visible.
+  __shared__ int groupCopyEpoch[kMaxWarpGroups];
 
   int warpGroupIdInBlock = warpId / kWarpsPerGroup;
   int inGroupWarpId = warpId % kWarpsPerGroup;
@@ -264,6 +291,7 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   if (inGroupWarpId == 0 && laneId == 0) {
     groupData[warpGroupIdInBlock] = 0;
     groupCounters[warpGroupIdInBlock] = kWarpsPerGroup - 1;
+    groupCopyEpoch[warpGroupIdInBlock] = 0;
   }
   __syncthreads();
 
@@ -279,7 +307,43 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
+
+  if constexpr (EnableLL128 || EnableEpll) {
+    // [exp/epll-port] LL128 upfront count: the per-dst send count is fully determined by the
+    // routing table (tokenIndices) + the same dedup as the send loop, so warp0 computes it
+    // locally and signals each peer EARLY (no grid barrier). The receiver then learns its
+    // per-source counts cheaply and gates token arrival via per-token flags below.
+    MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
+    if (globalWarpId == 0 && args.tokenIndices) {
+      // Each lane owns one destination pe and counts how many of this rank's tokens route to it
+      // (once per token == the send-loop dedup), then signals that peer early.
+      index_t destPe = laneId;
+      if (destPe < npes) {
+        index_t myCount = 0;
+        for (int t = 0; t < args.curRankNumToken; ++t) {
+          for (int e = 0; e < config.numExpertPerToken; ++e) {
+            index_t dst =
+                args.tokenIndices[t * config.numExpertPerToken + e] / config.numExpertPerRank;
+            if (dst == destPe) {
+              ++myCount;  // first (and only counted) occurrence for this token
+              break;
+            }
+          }
+        }
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+        // reuse-spin: wait until the previous iteration's count was consumed (reset to 0).
+        shmem::ShmemInt32WaitUntilEquals(signal, 0);
+        // +1 so a zero count is still distinguishable from "not yet sent".
+        core::AtomicStoreReleaseSystem(signal, myCount + 1);
+      }
+    }
+  }
+
   MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
+
+  // [exp/epll-port] epll: local count of this group's non-skipped iterations, scaled by
+  // kWarpsPerGroup. The header warp waits until groupCopyEpoch reaches this before flagging.
+  [[maybe_unused]] int epllSendEpoch = 0;
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
@@ -291,8 +355,9 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
-      // prefetch remote addr
-      auto dispTokOffset = args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe);
+      // prefetch remote addr (unused under SPSC: deterministic local slot, no remote RMW)
+      [[maybe_unused]] auto dispTokOffset =
+          args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe);
 
       // ALL warps in warp-group do dedup independently (same input = same result)
       assert(config.numExpertPerToken < warpSize);
@@ -309,44 +374,43 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
         continue;
       }
 
-      // prefetch remote addr
-      auto dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+      // prefetch remote addr (unused under LL128: token goes to combineInp staging, then local deflag)
+      [[maybe_unused]] auto dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
 
-      // Header Warp: atomic allocation + notify via shared memory
+      // Header Warp: atomic allocation + publish destTokId via shared memory.
+      // EXP1 (reserve/copy decouple): publish destTokId ASAP, then issue the 16KB
+      // WarpCopy first; the dependent remote metadata scalar writes are deferred to
+      // AFTER the copy so their per-transaction issue latency overlaps the copy.
       if (inGroupWarpId == 0) {
         if (laneId == 0) {
           // Atomic allocation
-          destTokId = atomicAdd(dispTokOffset, 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "Total recv token overflow: increase maxTotalRecvTokens");
+          MORI_TRACE_NEXT(seq, Slot::DispatchReserveAtomic);
+          if constexpr (EnableSPSC || EnableEpll) {
+            // [exp/epll-port] SPSC: deterministic source-owned slot, no remote atomic.
+            // Reuse destPeTokenCounter as the local per-dest index (0,1,2,... == final
+            // count, so the notify-phase count signal stays correct). Recv buffer is
+            // partitioned by source: slot in [srcPe*MaxRecvPerRank, (srcPe+1)*MaxRecvPerRank).
+            index_t localIdx = atomicAdd(args.destPeTokenCounter + destPe, 1);
+            destTokId = myPe * config.MaxNumTokensToRecvPerRank() + localIdx;
+            assert(localIdx < config.MaxNumTokensToRecvPerRank() && "SPSC lane overflow");
+          } else {
+            destTokId = atomicAdd(dispTokOffset, 1);
+            assert(destTokId < config.MaxNumTokensToRecv() &&
+                   "Total recv token overflow: increase maxTotalRecvTokens");
+          }
 
           // Wait for all consumers done (counter == N-1), then set to 0
+          MORI_TRACE_NEXT(seq, Slot::DispatchReserveHandshake);
           while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
                  kWarpsPerGroup - 1) {
           }
           // Write to shared mem: use (i+1) to avoid confusion with initial value 0
+          MORI_TRACE_NEXT(seq, Slot::DispatchReserveWrites);
           __hip_atomic_store((unsigned long long*)&groupData[warpGroupIdInBlock],
                              ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
-
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
         }
         destTokId = __shfl(destTokId, 0);
-
-        // Write weights and indices: only warp 0 writes
-        if (laneId < config.numExpertPerToken) {
-          if (args.weightsBuf) {
-            args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
-                destPe)[destTokId * config.numExpertPerToken + laneId] =
-                args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
-          }
-          args.shmemOutIndicesMemObj->template GetAs<index_t*>(
-              destPe)[destTokId * config.numExpertPerToken + laneId] =
-              args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        }
       } else {
         // Normal Warps: spin wait for iteration match, then consume
         // Only lane 0 spins, then broadcast to other lanes
@@ -366,10 +430,118 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
       // All warps in warpgroup: copy their portion of token data
       size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
+      [[maybe_unused]] size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
-                           args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
+      MORI_TRACE_NEXT(seq, Slot::DispatchCopyToken);
+      if constexpr (EnableEpll && EnableEpllLine) {
+        // [exp/epll-port] epll_full: write the token as self-flagged LL128 lines into the peer's
+        // staging slot (7 data words + 1 seq flag per 64B line, one wave per 4-lane group). No
+        // __threadfence_system, no group-epoch, no separate release flag: each line self-gates the
+        // receiver. Metadata goes via the deferred remote scalar writes below (kEpllDeferMeta).
+        const size_t hiddenBytes = config.HiddenBytes(sizeof(T));
+        const size_t hiddenWords = hiddenBytes / sizeof(uint64_t);
+        const size_t llStride = epll::LLStrideBytes(hiddenBytes);
+        uint8_t* lineBase = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                            (size_t)destTokId * llStride;
+        const uint64_t* srcWords =
+            reinterpret_cast<const uint64_t*>(args.inpTokenBuf + srcTokOffset);
+        epll::LLWriteToken(lineBase, srcWords, hiddenWords, epll::kLLReadyFlag,
+                           inGroupWarpId * warpSize + laneId, kWarpsPerGroup * warpSize);
+      } else if constexpr (EnableEpll) {
+        // [exp/epll-port] epll: the WHOLE warp-group writes the token DIRECTLY into the final
+        // dispatchOut slot on the peer (warp-group split, no staging, no deflag pass), matching
+        // the base path's per-warp bandwidth. Each warp fences its own chunk to system scope and
+        // bumps the group's copy epoch; the header warp waits for the group, then publishes a
+        // release flag in the combineInp staging slot's flag word so flag-visible => data-visible.
+        // The receiver only WAITS on the flag (multi-block, below); it does not copy.
+        core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
+                             args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
+        __threadfence_system();
+        if (laneId == 0) {
+          __hip_atomic_fetch_add(&groupCopyEpoch[warpGroupIdInBlock], 1, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_WORKGROUP);
+        }
+        if (inGroupWarpId == 0) {
+          epllSendEpoch += kWarpsPerGroup;
+          if (laneId == 0) {
+            while (__hip_atomic_load(&groupCopyEpoch[warpGroupIdInBlock], __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_WORKGROUP) < epllSendEpoch) {
+            }
+            uint8_t* stageBase =
+                args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                (size_t)destTokId * config.MaxXferBytesPerToken();
+            // [exp/epll-port] Step B: metadata-in-line. Pack {srcTokFlat, weights, indices} into a
+            // single contiguous region at the staging slot start (hidden goes straight to
+            // dispatchOut, so [0,HiddenBytes) is free) instead of 1+2*topk separate remote scalar
+            // writes. The release-flag store below orders these writes; the receiver unpacks locally.
+            // [exp/epll-port] EnableEpllNoMeta ablation: skip the inline pack entirely and fall back
+            // to the deferred remote scalar metadata writes below (base-style), keeping only the
+            // direct dispatchOut write + per-slot release flag. Isolates the inline-meta cost.
+            if constexpr (!EnableEpllNoMeta) {
+              const int topk = config.numExpertPerToken;
+              *reinterpret_cast<index_t*>(stageBase) = FlatTokenIndex(config, myPe, srcTokId);
+              float* mW = reinterpret_cast<float*>(stageBase + sizeof(index_t));
+              index_t* mIdx = reinterpret_cast<index_t*>(stageBase + sizeof(index_t) +
+                                                         (size_t)topk * sizeof(float));
+              for (int e = 0; e < topk; ++e) {
+                if (args.weightsBuf) mW[e] = args.weightsBuf[(size_t)srcTokId * topk + e];
+                mIdx[e] = args.tokenIndices[(size_t)srcTokId * topk + e];
+              }
+            }
+            uint32_t* flag = reinterpret_cast<uint32_t*>(stageBase + config.HiddenBytes(sizeof(T)));
+            core::AtomicStoreReleaseSystem(flag, 1u);
+          }
+        }
+      } else if constexpr (EnableLL128) {
+        // [exp/epll-port] LL128: header warp writes the whole token into the interleaved staging
+        // slot on the peer (combineInp@destPe), then a release flag right after the hidden data
+        // ("flag next to data") so flag-visible => data-visible. One warp per token (no warp-group
+        // split) keeps the data+flag ordering on a single wave. The receiver deflags locally below.
+        if (inGroupWarpId == 0) {
+          uint8_t* stageBase = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                               (size_t)destTokId * config.MaxXferBytesPerToken();
+          core::WarpCopy<T, 2>(reinterpret_cast<T*>(stageBase), args.inpTokenBuf + srcTokOffset,
+                               hiddenDim);
+          if (laneId == 0) {
+            // Whole-wave vmem writes drained, then publish the flag (release, system scope).
+            __threadfence_system();
+            uint32_t* flag = reinterpret_cast<uint32_t*>(stageBase + config.HiddenBytes(sizeof(T)));
+            core::AtomicStoreReleaseSystem(flag, 1u);
+          }
+        }
+      } else {
+        core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
+                             args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
+      }
+
+      // Deferred remote metadata scalar writes (header warp only), issued after the
+      // big copy so the small xGMI transactions overlap the copy's store traffic.
+      // [exp/epll-port] Step B: epll packs metadata inline (above) and unpacks on the receiver,
+      // so it skips these per-field remote scalar writes; only the LOCAL dispDestTokIdMap is kept.
+      if (inGroupWarpId == 0) {
+        if (laneId == 0) {
+          // SPSC already consumed destPeTokenCounter for the local slot index above.
+          if constexpr (!EnableSPSC && !EnableEpll) atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          if constexpr (!EnableEpll || kEpllDeferMeta) {
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+                FlatTokenIndex(config, myPe, srcTokId);
+          }
+        }
+        // Write weights and indices: only warp 0 writes
+        if constexpr (!EnableEpll || kEpllDeferMeta) {
+          if (laneId < config.numExpertPerToken) {
+            if (args.weightsBuf) {
+              args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(
+                  destPe)[destTokId * config.numExpertPerToken + laneId] =
+                  args.weightsBuf[srcTokId * config.numExpertPerToken + laneId];
+            }
+            args.shmemOutIndicesMemObj->template GetAs<index_t*>(
+                destPe)[destTokId * config.numExpertPerToken + laneId] =
+                args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+          }
+        }
+      }
 
       // Write scales: split across 4 warps
       if (hasScales) {
@@ -388,43 +560,221 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
     }
   }
 
-  __syncthreads();
-  if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+  if constexpr (EnableEpll) {
+    // [exp/epll-port] epll completion: data is already in the final dispatchOut (direct write).
+    // No grid barrier gating the count (counts arrived upfront), no warp0-serial handshake, no
+    // deflag copy. Every block reads the upfront per-source counts -> prefix bases, then the whole
+    // grid (per-thread grid-stride) WAITS on each slot's release flag so the kernel exits only
+    // once all inbound tokens have landed (the GEMM-ready guarantee). A single cheap intra-device
+    // grid barrier at the end resets the count signals for the next iteration's reuse.
+    constexpr int kMaxLLPes = 64;
+    __shared__ index_t llBase[kMaxLLPes + 1];
+    __shared__ index_t llTotal;
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
+    if (thdId == 0) {
+      index_t acc = 0;
+      for (int s = 0; s < npes; ++s) {
+        index_t v;
+        while ((v = core::AtomicLoadRelaxedSystem(recvTokenNums + s)) <= 0) {
+          if constexpr (EnableSnooze) __builtin_amdgcn_s_sleep(1);
+        }
+        llBase[s] = acc;
+        acc += (v - 1);
+      }
+      llBase[npes] = acc;
+      llTotal = acc;
+    }
+    __syncthreads();
 
-  // Send token num & token to expert mapping to other ranks
-  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      // Wait until all tokens are sent
+    index_t total = llTotal;
+    size_t hiddenBytes = config.HiddenBytes(sizeof(T));
+    size_t slotStride = config.MaxXferBytesPerToken();
+    uint8_t* stageLocal = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>();
+    if constexpr (EnableEpllLine) {
+      // [exp/epll-port] epll_full completion: each WARP copies one slot's self-flagged LL128 lines
+      // from local staging into the clean contiguous dispatchOut (poll-per-line, no fence, metadata
+      // already landed via the deferred remote scalar writes). Per-warp grid-stride over all tokens.
+      const size_t hiddenWords = hiddenBytes / sizeof(uint64_t);
+      const size_t llStride = epll::LLStrideBytes(hiddenBytes);
+      uint64_t* dispWords =
+          reinterpret_cast<uint64_t*>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>());
+      for (int r = globalWarpId; r < total; r += globalWarpNum) {
+        int src = 0;
+        while (src < npes && r >= llBase[src + 1]) ++src;
+        index_t localIdx = r - llBase[src];
+        index_t slot = (index_t)src * config.MaxNumTokensToRecvPerRank() + localIdx;
+        const uint8_t* lineBase = stageLocal + (size_t)slot * llStride;
+        uint64_t* dst = dispWords + (size_t)slot * hiddenWords;
+        epll::LLReadToken(lineBase, dst, hiddenWords, epll::kLLReadyFlag, laneId, warpSize,
+                          epll::kDefaultPollIters);
+      }
+    } else {
+      int gThd = blockIdx.x * thdNum + thdId;
+      int gThdNum = gridDim.x * thdNum;
+      for (int r = gThd; r < total; r += gThdNum) {
+        int src = 0;
+        while (src < npes && r >= llBase[src + 1]) ++src;
+        index_t localIdx = r - llBase[src];
+        index_t slot = (index_t)src * config.MaxNumTokensToRecvPerRank() + localIdx;
+        uint8_t* mBase = stageLocal + (size_t)slot * slotStride;
+        uint32_t* flag = reinterpret_cast<uint32_t*>(mBase + hiddenBytes);
+        while (core::AtomicLoadRelaxedSystem(flag) == 0u) {
+          if constexpr (EnableSnooze) __builtin_amdgcn_s_sleep(1);
+        }
+        // [exp/epll-port] Step B: acquire fence pairs with the sender's release-flag store so the
+        // inline meta-block (and hidden in dispatchOut) is visible, then unpack it LOCALLY into the
+        // dense metadata buffers (replaces the sender's remote scalar writes with a local scatter).
+        // [exp/epll-port] EnableEpllNoMeta ablation: the sender already wrote metadata via deferred
+        // remote scalar stores (base-style), so there is nothing to unpack here; just reset the flag.
+        __threadfence_system();
+        if constexpr (!EnableEpllNoMeta) {
+          const int topk = config.numExpertPerToken;
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[slot] =
+              *reinterpret_cast<index_t*>(mBase);
+          float* mW = reinterpret_cast<float*>(mBase + sizeof(index_t));
+          index_t* mIdx =
+              reinterpret_cast<index_t*>(mBase + sizeof(index_t) + (size_t)topk * sizeof(float));
+          float* wOut = args.shmemDispatchOutWeightsMemObj->template GetAs<float*>();
+          index_t* idxOut = args.shmemOutIndicesMemObj->template GetAs<index_t*>();
+          for (int e = 0; e < topk; ++e) {
+            if (args.weightsBuf) wOut[(size_t)slot * topk + e] = mW[e];
+            idxOut[(size_t)slot * topk + e] = mIdx[e];
+          }
+        }
+        core::AtomicStoreRelaxedSystem(flag, 0u);  // reset for next-iter reuse
+      }
+    }
+
+    __syncthreads();
+    __threadfence_system();
+    if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+    if (blockIdx.x == 0 && thdId == 0) {
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
-      // Add 1 so that when token number == 0, receiver side still know the signal is sent
-      index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
-      index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
-      shmem::ShmemInt32WaitUntilEquals(signal, 0);
-      core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
-    }
-  }
-
-  // Phase 2: recv token
-  // Each warp wait until sender finished by waiting token number signal
-  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
-  index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
-  if (globalWarpId == 0) {
-    for (int destPe = laneId; destPe < npes; destPe += warpSize) {
-      index_t* signal = recvTokenNums + destPe;
-      index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-
-      // reset local counter
-      args.destPeTokenCounter[destPe] = 0;
-    }
-
-    // reset counter
-    if (laneId == 0) {
+      *args.totalRecvTokenNum = total;
+      for (int s = 0; s < npes; ++s) {
+        core::AtomicStoreRelaxedSystem(recvTokenNums + s, 0);
+        args.destPeTokenCounter[s] = 0;
+      }
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+    }
+  } else if constexpr (EnableLL128) {
+    // [exp/epll-port] LL128 completion: no grid barrier, no warp0-serial count handshake.
+    // Counts already arrived upfront; block 0 reads them, then all its warps poll per-token
+    // flags in parallel and deflag (copy hidden data only) from the interleaved staging buffer
+    // into the contiguous dispatchOut that the downstream (external) gemm reads. Staging is the
+    // local combineInp (uncached, free during dispatch), so flag-visible => data-visible.
+    constexpr int kMaxLLPes = 64;
+    __shared__ index_t llBase[kMaxLLPes + 1];
+    __shared__ index_t llTotal;
+    MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    if (blockIdx.x == 0) {
+      if (thdId == 0) {
+        index_t acc = 0;
+        for (int s = 0; s < npes; ++s) {
+          index_t v;
+          while ((v = core::AtomicLoadRelaxedSystem(recvTokenNums + s)) <= 0) {
+            if constexpr (EnableSnooze) __builtin_amdgcn_s_sleep(1);
+          }
+          llBase[s] = acc;
+          acc += (v - 1);
+        }
+        llBase[npes] = acc;
+        llTotal = acc;
+      }
+      __syncthreads();
+
+      index_t total = llTotal;
+      size_t hiddenBytes = config.HiddenBytes(sizeof(T));
+      size_t slotStride = config.MaxXferBytesPerToken();
+      uint8_t* stageLocal = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>();
+      T* dispLocal = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>();
+      for (int r = warpId; r < total; r += warpNum) {
+        int src = 0;
+        while (src < npes && r >= llBase[src + 1]) ++src;
+        index_t localIdx = r - llBase[src];
+        index_t slot = (index_t)src * config.MaxNumTokensToRecvPerRank() + localIdx;
+        uint8_t* slotBase = stageLocal + (size_t)slot * slotStride;
+        uint32_t* flag = reinterpret_cast<uint32_t*>(slotBase + hiddenBytes);
+        // All lanes spin on the (uncached) flag; once set, the producer's prior data writes are
+        // in memory, so the deflag copy below reads valid data.
+        while (core::AtomicLoadRelaxedSystem(flag) == 0u) {
+          if constexpr (EnableSnooze) __builtin_amdgcn_s_sleep(1);
+        }
+        core::WarpCopy<T, 2>(dispLocal + (size_t)slot * hiddenDim,
+                             reinterpret_cast<T*>(slotBase), hiddenDim);
+        if (laneId == 0) core::AtomicStoreRelaxedSystem(flag, 0u);  // reset for next iter reuse
+      }
+      __syncthreads();
+
+      if (thdId == 0) {
+        *args.totalRecvTokenNum = total;
+        for (int s = 0; s < npes; ++s) {
+          core::AtomicStoreRelaxedSystem(recvTokenNums + s, 0);  // consume upfront count signal
+          args.destPeTokenCounter[s] = 0;
+        }
+        args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+      }
+    }
+  } else {
+    __syncthreads();
+    if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
+
+    // Send token num & token to expert mapping to other ranks
+    MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
+    if (globalWarpId == 0) {
+      for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+        // Wait until all tokens are sent
+        shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
+        __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+
+        // Add 1 so that when token number == 0, receiver side still know the signal is sent
+        index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
+        index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
+        if constexpr (EnableSnooze) {
+          // [exp/epll-port] P3: s_sleep backoff on the cross-device reuse spin (ep_ll snooze).
+          while (core::AtomicLoadRelaxedSystem(signal) != 0) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+        } else {
+          shmem::ShmemInt32WaitUntilEquals(signal, 0);
+        }
+        core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
+      }
+    }
+
+    // Phase 2: recv token
+    // Each warp wait until sender finished by waiting token number signal
+    MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
+    index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
+    if (globalWarpId == 0) {
+      for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+        index_t* signal = recvTokenNums + destPe;
+        index_t recvTokenNum;
+        if constexpr (EnableSnooze) {
+          // [exp/epll-port] P3: s_sleep backoff on the cross-device count-wait spin (ep_ll snooze).
+          index_t v;
+          while ((v = core::AtomicLoadRelaxedSystem(signal)) <= 0) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+          recvTokenNum = v - 1;
+        } else {
+          recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
+        }
+        core::AtomicStoreRelaxedSystem(signal, 0);
+        atomicAdd(args.totalRecvTokenNum, recvTokenNum);
+
+        // reset local counter
+        args.destPeTokenCounter[destPe] = 0;
+      }
+
+      // reset counter
+      if (laneId == 0) {
+        args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+      }
     }
   }
 
@@ -445,7 +795,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, bool EnableEpllP1 = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -591,13 +941,31 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                          config.numExpertPerToken);
         }
       }
+      if constexpr (EnableEpllP1) {
+        // [exp/epll-port] P1: publish per-record readiness after staging this token to
+        // destPe (replaces the global CrossDeviceBarrier). Flag index == data slot offset,
+        // so the producer/consumer mapping is identical to the staged data.
+        if (laneId == 0) {
+          __threadfence_system();
+          uint32_t* readyFlag = args.combineReadyFlagMemObj->template GetAs<uint32_t*>(destPe) +
+                                SendBufSlotOffset(config, myPe, destLocalTokId);
+          core::AtomicStoreRelaxedSystem(readyFlag, static_cast<uint32_t>(crossDeviceBarrierFlag));
+        }
+      }
     }
 #endif
   }
 
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
-  CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+  if constexpr (EnableEpllP1) {
+    // [exp/epll-port] P1: no global barrier; per-record flags gate each read below.
+    // Advance the epoch so this launch's flags are distinguishable from the next.
+    __syncthreads();
+    if (globalThdId == 0) atomicAdd(args.crossDeviceBarrierFlag, 1);
+  } else {
+    CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
+  }
   *args.totalRecvTokenNum = 0;
   if (args.curRankNumToken == 0) return;
 
@@ -663,6 +1031,17 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
                 SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
             srcScalePtrs[j] = (scalePtr[0] < 0.0f) ? scalePtr : nullptr;
+          }
+          if constexpr (EnableEpllP1) {
+            // [exp/epll-port] P1: wait for this record's readiness flag (set by producer
+            // destPe after it staged the token) instead of a global barrier.
+            uint32_t* readyFlag = args.combineReadyFlagMemObj->template GetAs<uint32_t*>(myPe) +
+                                  SendBufSlotOffset(config, destPe, tokenId);
+            while (core::AtomicLoadRelaxedSystem(readyFlag) <
+                   static_cast<uint32_t>(crossDeviceBarrierFlag)) {
+              __builtin_amdgcn_s_sleep(1);
+            }
+            __threadfence_system();
           }
         }
       } else {
@@ -744,7 +1123,17 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
+      // BENCH_NOOP_COMBINE: transport-only mirror of ep_ll (no topk sum)
+      TokT* firstSrc = nullptr;
+      for (int j = 0; j < validAccumCount; ++j) {
+        if (srcPtrs[j] != nullptr) {
+          firstSrc = srcPtrs[j];
+          break;
+        }
+      }
+      if (firstSrc != nullptr) {
+        core::WarpCopy(outPtr, firstSrc, hiddenDimSize);
+      }
     }
 
     if constexpr (UseWeights) {
@@ -761,10 +1150,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, bool EnableEpllP1 = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems>(args);
+                                UseWeights, Vec8Top8BlockElems, EnableEpllP1>(args);
 }
 
 }  // namespace moe

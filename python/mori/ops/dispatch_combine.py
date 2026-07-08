@@ -575,8 +575,23 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNodeLL.value:
+            # [exp/epll-port] MORI_LL_OPT selects ablation dispatch variant (bf16 only).
+            ll_opt = os.environ.get("MORI_LL_OPT", "base")
+            disp_name = f"EpDispatchIntraNodeLLKernel_{sfx}"
+            if sfx == "bf16" and ll_opt in ("p3", "full"):
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_snooze"
+            elif sfx == "bf16" and ll_opt == "spsc":
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_spsc"
+            elif sfx == "bf16" and ll_opt == "ll128":
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_ll128"
+            elif sfx == "bf16" and ll_opt == "epll":
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_epll"
+            elif sfx == "bf16" and ll_opt == "epll_nometa":
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_epll_nometa"
+            elif sfx == "bf16" and ll_opt == "epll_full":
+                disp_name = "EpDispatchIntraNodeLLKernel_bf16_epll_full"
             self._launch(
-                f"EpDispatchIntraNodeLLKernel_{sfx}",
+                disp_name,
                 grid,
                 block,
                 shared_mem,
@@ -872,8 +887,16 @@ class EpDispatchCombineOp:
                         args_ptr,
                     )
                 else:
+                    # [exp/epll-port] MORI_LL_OPT selects P1 combine variant (IntraNodeLL bf16).
+                    comb_name = f"EpCombineIntraNodeKernel_{sfx}_nop2p"
+                    if (
+                        kt == EpDispatchCombineKernelType.IntraNodeLL.value
+                        and sfx == "bf16"
+                        and os.environ.get("MORI_LL_OPT", "base") in ("p1", "full")
+                    ):
+                        comb_name = "EpCombineIntraNodeKernel_bf16_nop2p_p1"
                     self._launch(
-                        f"EpCombineIntraNodeKernel_{sfx}_nop2p",
+                        comb_name,
                         grid,
                         block,
                         shared_mem,

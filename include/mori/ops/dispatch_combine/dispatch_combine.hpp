@@ -368,6 +368,11 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
 
+  // [exp/epll-port] P1 per-record combine readiness flags (separate flag region).
+  // Sized worldSize * MaxNumTokensToSendPerRank uint32; producer sets flag[(producerPe, srcTok)]
+  // on the consumer rank after staging; consumer polls locally before accum read.
+  mori::application::SymmMemObjPtr combineReadyFlagMemObj;
+
   // Inter-node v1 kernel parameters
   // Signal the completion of inter-node token transfer
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
@@ -433,6 +438,7 @@ struct EpDispatchCombineArgs {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
+  mori::application::SymmMemObjPtr combineReadyFlagMemObj;
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;
@@ -496,6 +502,7 @@ struct EpDispatchCombineArgsRaw {
   index_t* totalRecvTokenNum{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
+  mori::application::SymmMemObjPtr combineReadyFlagMemObj;
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
   index_t* destNodeTokenCounter{nullptr};
   mori::application::SymmMemObjPtr nodeRecvTokenNumMemObj;

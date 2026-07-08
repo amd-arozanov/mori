@@ -205,6 +205,17 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                       config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
   }
 
+  // [exp/epll-port] MORI_LL_OPT=epll_full uses a self-flagged LL128 line format in combineInp
+  // staging (7 data words + 1 flag per 64B line => ~+12.5% over the raw token). The variant is
+  // selected at launch (Python), not known here, so always reserve the larger size for IntraNodeLL.
+  if (config.kernelType == KernelType::IntraNodeLL) {
+    const size_t hiddenBytes = config.HiddenBytes(config.maxTokenTypeSize);
+    const size_t words = (hiddenBytes + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    const size_t llStride = ((words + 6) / 7) * 64;  // ceil(words/7) lines * 64B
+    const size_t llStagingSize = static_cast<size_t>(config.MaxNumTokensToRecv()) * llStride;
+    if (llStagingSize > maxStagingSize) maxStagingSize = llStagingSize;
+  }
+
   if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
@@ -434,6 +445,13 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   crossDeviceBarrierMemObj =
       ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
+  // [exp/epll-port] P1 per-record combine readiness flags.
+  size_t combineReadyFlagSize =
+      (size_t)config.worldSize * config.MaxNumTokensToSendPerRank() * sizeof(uint32_t);
+  combineReadyFlagMemObj =
+      ShmemMallocAndReturnMemObjPtr(combineReadyFlagSize, hipDeviceMallocUncached);
+  HIP_RUNTIME_CHECK(hipMemset(combineReadyFlagMemObj->localPtr, 0, combineReadyFlagSize));
+
   size_t interNodeChunkFlagSize =
       config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
   interNodeChunkFlagMemObj =
@@ -453,6 +471,7 @@ void EpDispatchCombineHandle::FinalizeBarrier() {
   HIP_RUNTIME_CHECK(hipFree(interNodeChunkFlagCombine));
   HIP_RUNTIME_CHECK(hipFree(interNodeBlocksBarrier));
   ShmemFree(crossDeviceBarrierMemObj->localPtr);
+  ShmemFree(combineReadyFlagMemObj->localPtr);
   ShmemFree(interNodeChunkFlagMemObj->localPtr);
 }
 
@@ -506,6 +525,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.totalRecvTokenNum = handle.totalRecvTokenNum;
   args.crossDeviceBarrierMemObj = handle.crossDeviceBarrierMemObj;
   args.crossDeviceBarrierFlag = handle.crossDeviceBarrierFlag;
+  args.combineReadyFlagMemObj = handle.combineReadyFlagMemObj;
   args.interNodeChunkFlagMemObj = handle.interNodeChunkFlagMemObj;
   args.destNodeTokenCounter = handle.destNodeTokenCounter;
   args.nodeRecvTokenNumMemObj = handle.nodeRecvTokenNumMemObj;
